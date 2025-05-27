@@ -1,0 +1,152 @@
+// 加载研究区边界
+var aoi = ee.FeatureCollection("users/jianghanyong15/xuancheng"); 
+
+// 可视化研究区边界
+var empty = ee.Image().toByte();
+var outline = empty.paint({
+  featureCollection: aoi,
+  color: 0,
+  width: 3
+});
+Map.addLayer(outline, {palette: "ff0000"}, "研究区边界");
+Map.centerObject(aoi, 10);
+
+// -------------------------- Sentinel-2 云掩膜与预处理 --------------------------
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask1 = qa.bitwiseAnd(cloudBitMask).eq(0).and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  
+  var cloudProb = image.select('MSK_CLDPRB');
+  var scl = image.select('SCL');
+  var shadow = scl.eq(3); 
+  var cirrus = scl.eq(10); 
+  var mask2 = cloudProb.lt(50).and(shadow.not()).and(cirrus.not());
+  
+  var mask = mask1.and(mask2);
+  return image.updateMask(mask).divide(10000);
+}
+
+var s2_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(aoi)
+  .filterDate('2019-01-01', '2020-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(maskS2clouds);
+
+// -------------------------- Landsat-8 数据预处理 --------------------------
+function processL8(image) {
+  var opticalBands = image.select(['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5'])
+    .multiply(0.0000275)
+    .add(-0.2)
+    .rename(['L8_B2', 'L8_B3', 'L8_B4', 'L8_B5']);
+  
+  return image.addBands(opticalBands);
+}
+
+var l8_col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+  .filterBounds(aoi)
+  .filterDate('2019-01-01', '2020-12-31')
+  .filter(ee.Filter.lt('CLOUD_COVER', 20))
+  .map(processL8);
+
+// -------------------------- 光谱指数计算 --------------------------
+function addS2Indices(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var evi = img.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',
+    {NIR: img.select('B8'), RED: img.select('B4'), BLUE: img.select('B2')}
+  ).rename('EVI');
+  
+  var bsi = img.expression(
+    '((RED + SWIR1) - (NIR + BLUE)) / ((RED + SWIR1) + (NIR + BLUE))',
+    {RED: img.select('B4'), BLUE: img.select('B2'), NIR: img.select('B8'), SWIR1: img.select('B11')}
+  ).rename('BSI');
+  
+  return img.addBands([ndvi, ndwi, evi, bsi]);
+}
+
+s2_col = s2_col.map(addS2Indices);
+
+// -------------------------- 多源数据合成 --------------------------
+var s2_median = s2_col.median().select([
+  'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12', 
+  'NDVI', 'NDWI', 'EVI', 'BSI'
+]);
+
+var l8_median = l8_col.median().select(['L8_B2', 'L8_B3', 'L8_B4', 'L8_B5']);
+
+var dem = ee.Image("USGS/SRTMGL1_003").clip(aoi);
+var terrain = ee.Terrain.products(dem).select(['slope', 'aspect', 'elevation']);
+
+var feature_stack = s2_median.addBands(l8_median).addBands(terrain).clip(aoi);
+
+// -------------------------- 样本点特征提取（已简化类别）--------------------------
+// 假设样本点已在Geometry Imports中命名为：
+// Cropland, Forest, edulis, Grassland, Water, Barren, Impervious
+// 每个点需设置landcover属性（1=Cropland，2=Forest，3=edulis，4=Grassland，5=Water，6=Barren，7=Impervious）
+var train_points = Cropland.merge(Forest).merge(edulis).merge(Grassland).merge(Water).merge(Barren).merge(Impervious);
+
+// 检查样本数量
+print("Cropland样本数:", Cropland.size());
+print("Forest样本数:", Forest.size());
+print("edulis样本数:", edulis.size());
+print("Grassland样本数:", Grassland.size());
+print("Water样本数:", Water.size());
+print("Barren样本数:", Barren.size());
+print("Impervious样本数:", Impervious.size());
+print("总样本数:", train_points.size());
+
+var train_data = feature_stack.sampleRegions({
+  collection: train_points,
+  properties: ['landcover'],
+  scale: 10,
+  tileScale: 4
+});
+
+// -------------------------- 随机森林分类 --------------------------
+var withRandom = train_data.randomColumn('random');
+var split = 0.7;
+var training = withRandom.filter(ee.Filter.lt('random', split));
+var testing = withRandom.filter(ee.Filter.gte('random', split));
+
+var rf = ee.Classifier.smileRandomForest({
+  numberOfTrees: 200,
+  bagFraction: 0.8
+}).train({
+  features: training,
+  classProperty: 'landcover',
+  inputProperties: feature_stack.bandNames()
+});
+
+var classification = feature_stack.classify(rf);
+
+// -------------------------- 精度评估 --------------------------
+var test_results = testing.classify(rf);
+var errorMatrix = test_results.errorMatrix('landcover', 'classification');
+print('混淆矩阵:', errorMatrix);
+print('总体精度:', errorMatrix.accuracy());
+print('Kappa系数:', errorMatrix.kappa());
+
+// -------------------------- 可视化与导出 --------------------------
+// 颜色映射：
+// 1=Cropland(浅绿), 2=Forest(深绿), 3=edulis(黄绿), 4=Grassland(草绿), 
+// 5=Water(蓝), 6=Barren(棕), 7=Impervious(灰)
+var palette = ['#98FB98', '#006400', '#FFFF00', '#7CFC00', 
+               '#0000FF', '#A52A2A', '#808080'];
+
+Map.addLayer(classification, {min: 1, max: 7, palette: palette}, '分类结果');
+
+Export.image.toDrive({
+  image: classification.clip(aoi),
+  description: 'xuancheng_simplified_classification',
+  folder: 'GEE_exports',
+  scale: 10,
+  region: aoi,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// 输出特征重要性
+print('特征重要性:', rf.explain().get('importance'));
